@@ -20,13 +20,17 @@ from domainbed.lib.writers import get_writer
 from domainbed.trainer import train
 from sconf import Config
 
+# python train_all.py [train_name] --data_dir [domainbed_data_dir] --algorithm ERM \
+#  --dataset DomainNet --model vitbase --seed 1
+
 
 def main():
     parser = argparse.ArgumentParser(description="Domain generalization", allow_abbrev=False)
-    parser.add_argument("name", type=str)
-    parser.add_argument("configs", nargs="*")
-    parser.add_argument("--data_dir", type=str, default="datadir/")
-    parser.add_argument("--dataset", type=str, default="PACS")
+    parser.add_argument("--name", type=str, default="ProofOfConcept")
+    parser.add_argument("configs", nargs="*", help="Configuration files for the training", default=[])
+    parser.add_argument("--data_dir", type=str, default="X:\\DomainGeneralizationDatasets")
+    parser.add_argument("--model", type=str, default="vitbase")
+    parser.add_argument("--dataset", type=str, default="OfficeHome")
     parser.add_argument("--algorithm", type=str, default="ERM")
     parser.add_argument(
         "--trial_seed",
@@ -35,7 +39,7 @@ def main():
         help="Trial number (used for seeding split_dataset and random_hparams).",
     )
     parser.add_argument("--r", type=int, default=4, help="Rank of adapter.")
-    parser.add_argument("--seed", type=int, default=0, help="Seed for everything else")
+    parser.add_argument("--seed", type=int, default=1, help="Seed for everything else")
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--attention", type=bool, default=None)
     parser.add_argument("--l_aux", action="store_true", help="Use auxiliary loss")
