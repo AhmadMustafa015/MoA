@@ -20,17 +20,16 @@ from domainbed.lib.writers import get_writer
 from domainbed.trainer import train
 from sconf import Config
 
-# python train_all.py [train_name] --data_dir [domainbed_data_dir] --algorithm ERM \
-#  --dataset DomainNet --model vitbase --seed 1
+sys.path.append("../../")
+from helpers.wandb import WandbLogger  # Import WandbLogger
 
 
 def main():
     parser = argparse.ArgumentParser(description="Domain generalization", allow_abbrev=False)
-    parser.add_argument("--name", type=str, default="ProofOfConcept")
-    parser.add_argument("configs", nargs="*", help="Configuration files for the training", default=[])
-    parser.add_argument("--data_dir", type=str, default="X:\\DomainGeneralizationDatasets")
-    parser.add_argument("--model", type=str, default="vitbase")
-    parser.add_argument("--dataset", type=str, default="OfficeHome")
+    parser.add_argument("name", type=str)
+    parser.add_argument("configs", nargs="*")
+    parser.add_argument("--data_dir", type=str, default="datadir/")
+    parser.add_argument("--dataset", type=str, default="PACS")
     parser.add_argument("--algorithm", type=str, default="ERM")
     parser.add_argument(
         "--trial_seed",
@@ -39,7 +38,7 @@ def main():
         help="Trial number (used for seeding split_dataset and random_hparams).",
     )
     parser.add_argument("--r", type=int, default=4, help="Rank of adapter.")
-    parser.add_argument("--seed", type=int, default=1, help="Seed for everything else")
+    parser.add_argument("--seed", type=int, default=0, help="Seed for everything else")
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--attention", type=bool, default=None)
     parser.add_argument("--l_aux", action="store_true", help="Use auxiliary loss")
@@ -64,6 +63,13 @@ def main():
     )
     parser.add_argument("--prebuild_loader", action="store_true", help="Pre-build eval loaders")
     parser.add_argument("--en", type=bool, default=None)
+    # Add WandB arguments
+    parser.add_argument("--wandb", action="store_true", help="Use Weights & Biases logging")
+    parser.add_argument("--wandb_project", type=str, default="domain_generalization")
+    parser.add_argument("--wandb_entity", type=str, default="UBC-LEAVES")
+    parser.add_argument("--wandb_tags", type=str, nargs="*", default=None)
+    parser.add_argument("--wandb_offline", action="store_true", help="Use WandB in offline mode")
+
     args, left_argv = parser.parse_known_args()
     args.deterministic = True
 
@@ -99,7 +105,39 @@ def main():
         logger.setLevel("DEBUG")
     cmd = " ".join(sys.argv)
     logger.info(f"Command :: {cmd}")
+    # Initialize WandB logger if enabled
+    wandb_logger = None
+    if args.wandb:
+        # Prepare configuration for WandB
+        config = {
+            "algorithm": args.algorithm,
+            "dataset": args.dataset,
+            "test_envs": args.test_envs,
+            "seed": args.seed,
+            "trial_seed": args.trial_seed,
+            "adapter_rank": args.r,
+            "steps": args.steps,
+            "attention_only": args.attention,
+            "auxiliary_loss": args.l_aux,
+            "holdout_fraction": args.holdout_fraction,
+        }
 
+        # Add hyperparameters to config
+        for k, v in hparams.items():
+            config[f"hparam/{k}"] = v
+
+        # Initialize WandB logger
+        wandb_logger = WandbLogger(
+            config=config,
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.unique_name,
+            tags=args.wandb_tags,
+            job_type="Training",
+            offline=args.wandb_offline,
+            notes=f"Algorithm: {args.algorithm}, Dataset: {args.dataset}",
+        )
+        logger.info(f"WandB initialized: {args.wandb_project}/{args.unique_name}")
     logger.nofmt("Environment:")
     logger.nofmt("\tPython: {}".format(sys.version.split(" ")[0]))
     logger.nofmt("\tPyTorch: {}".format(torch.__version__))
@@ -145,6 +183,15 @@ def main():
         logger.nofmt(f"\tenv{i}: {env_property} (#{len(dataset[i])})")
     logger.nofmt("")
 
+    # Log dataset info to WandB
+    if wandb_logger:
+        env_data = []
+        for i, env_property in enumerate(dataset.environments):
+            env_data.append([i, env_property, len(dataset[i])])
+        wandb_logger.log_table(
+            "dataset_environments", data=env_data, columns=["Environment ID", "Environment", "Sample Count"]
+        )
+
     n_steps = args.steps or dataset.N_STEPS
     checkpoint_freq = args.checkpoint_freq or dataset.CHECKPOINT_FREQ
     logger.info(f"n_steps = {n_steps}")
@@ -165,7 +212,9 @@ def main():
     results = collections.defaultdict(list)
 
     for test_env in args.test_envs:
-
+        if wandb_logger:
+            # Log current test environment
+            wandb_logger.log({"current_test_env": test_env[0]})
         res, records = train(
             test_env,
             args=args,
@@ -174,11 +223,17 @@ def main():
             checkpoint_freq=checkpoint_freq,
             logger=logger,
             writer=writer,
+            wandb_logger=wandb_logger,  # Pass wandb_logger to the train function
         )
 
         all_records.append(records)
         for k, v in res.items():
             results[k].append(v)
+
+        # Log test results to WandB
+        if wandb_logger:
+            for k, v in res.items():
+                wandb_logger.log({f"test_env_{test_env[0]}/{k}": v})
 
     # log summary table
     logger.info("=== Summary ===")
@@ -189,11 +244,43 @@ def main():
     logger.info("Dataset: %s" % args.dataset)
 
     table = PrettyTable(["Selection"] + dataset.environments + ["Avg."])
+    summary_data = []
     for key, row in results.items():
-        row.append(np.mean(row))
-        row = [f"{acc:.3%}" for acc in row]
-        table.add_row([key] + row)
+        row_with_avg = row.copy()
+        avg_value = np.mean(row)
+        row_with_avg.append(avg_value)
+
+        # Format for console display
+        row_formatted = [f"{acc:.3%}" for acc in row_with_avg]
+        table.add_row([key] + row_formatted)
+
+        # Prepare data for WandB table
+        summary_row = [key] + [float(acc) for acc in row_with_avg]
+        summary_data.append(summary_row)
     logger.nofmt(table)
+
+    # Log summary table to WandB
+    if wandb_logger:
+        columns = ["Selection"] + dataset.environments + ["Average"]
+        wandb_logger.log_table("results_summary", data=summary_data, columns=columns)
+
+        # Log final averages
+        for key, row in results.items():
+            wandb_logger.log({f"final/{key}_avg": np.mean(row)})
+
+        # Save the final model as artifact
+        if args.out_dir:
+            final_model_path = args.out_dir / "final_model.pth"
+            if final_model_path.exists():
+                wandb_logger.log_artifact(
+                    str(final_model_path),
+                    artifact_name="final_model",
+                    artifact_type="model",
+                    description=f"Final {args.algorithm} model trained on {args.dataset}",
+                )
+
+        # Finish the wandb run
+        wandb_logger.finish_run()
 
 
 if __name__ == "__main__":

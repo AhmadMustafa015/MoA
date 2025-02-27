@@ -3,7 +3,7 @@ import copy
 import json
 import time
 from pathlib import Path
-
+import sys
 import loralib as lora
 import numpy as np
 import torch
@@ -23,14 +23,30 @@ def json_handler(v):
         return str(v)
     raise TypeError(f"`{type(v)}` is not JSON Serializable")
 
+
 def mark_only_attn_as_trainable(model) -> None:
     for n, p in model.named_parameters():
-        if 'attn' not in n:
+        if "attn" not in n:
             p.requires_grad = False
 
-def train(test_envs, args, hparams, n_steps, checkpoint_freq, logger, writer, target_env=None,sweep=False):
+
+def train(
+    test_envs,
+    args,
+    hparams,
+    n_steps,
+    checkpoint_freq,
+    logger,
+    writer,
+    wandb_logger=None,
+    target_env=None,
+    sweep=False,
+):
     logger.info("")
 
+    # Log to WandB that we're starting training
+    if wandb_logger:
+        wandb_logger.log({"status": "training_started", "test_environments": test_envs})
     #######################################################
     # setup dataset & loader
     #######################################################
@@ -46,9 +62,7 @@ def train(test_envs, args, hparams, n_steps, checkpoint_freq, logger, writer, ta
         testenv_properties = [str(dataset.environments[i]) for i in test_envs]
         testenv_name = "te_" + "_".join(testenv_properties)
 
-    logger.info(
-        "Testenv name escaping {} -> {}".format(testenv_name, testenv_name.replace(".", ""))
-    )
+    logger.info("Testenv name escaping {} -> {}".format(testenv_name, testenv_name.replace(".", "")))
     testenv_name = testenv_name.replace(".", "")
     logger.info(f"Test envs = {test_envs}, name = {testenv_name}")
 
@@ -63,15 +77,12 @@ def train(test_envs, args, hparams, n_steps, checkpoint_freq, logger, writer, ta
     logger.info(f"Batch sizes for each domain: {batch_sizes} (total={sum(batch_sizes)})")
 
     # calculate steps per epoch
-    steps_per_epochs = [
-        len(env) / batch_size
-        for (env, _), batch_size in iterator.train(zip(in_splits, batch_sizes))
-    ]
+    steps_per_epochs = [len(env) / batch_size for (env, _), batch_size in iterator.train(zip(in_splits, batch_sizes))]
     steps_per_epoch = min(steps_per_epochs)
     # epoch is computed by steps_per_epoch
     prt_steps = ", ".join([f"{step:.2f}" for step in steps_per_epochs])
     logger.info(f"steps-per-epoch for each domain: {prt_steps} -> min = {steps_per_epoch:.2f}")
-    best_acc=0.
+    best_acc = 0.0
     # setup loaders
     train_loaders = [
         InfiniteDataLoader(
@@ -101,21 +112,26 @@ def train(test_envs, args, hparams, n_steps, checkpoint_freq, logger, writer, ta
     #######################################################
     # setup algorithm (model)
     #######################################################
-    algorithm = algorithm_class(
-        dataset.input_shape,
-        dataset.num_classes,
-        len(dataset) - len(test_envs),
-        hparams,
-        args
-    )
+    algorithm = algorithm_class(dataset.input_shape, dataset.num_classes, len(dataset) - len(test_envs), hparams, args)
     algorithm.cuda()
-    
-    
+
     n_params = sum([p.numel() for p in algorithm.parameters()])
     logger.info("# of params = %d" % n_params)
 
     train_minibatches_iterator = zip(*train_loaders)
     checkpoint_vals = collections.defaultdict(lambda: [])
+
+    # Add WandB logging for model architecture
+    if wandb_logger and algorithm is not None:
+        # Watch gradients
+        wandb_logger.watch(algorithm, log="gradients", log_freq=100)
+
+        # Log model details
+        model_config = {
+            "model_class": algorithm.__class__.__name__,
+            "parameter_count": sum(p.numel() for p in algorithm.parameters() if p.requires_grad),
+        }
+        wandb_logger.log(model_config)
 
     #######################################################
     # start training loop
@@ -133,7 +149,7 @@ def train(test_envs, args, hparams, n_steps, checkpoint_freq, logger, writer, ta
     swad = None
     if hparams["swad"]:
         swad_algorithm = swa_utils.AveragedModel(algorithm)
-        
+
         swad_cls = getattr(swad_module, "LossValley")
         swad = swad_cls(evaluator, **hparams.swad_kwargs)
 
@@ -152,14 +168,11 @@ def train(test_envs, args, hparams, n_steps, checkpoint_freq, logger, writer, ta
 
         batches = misc.merge_dictlist(batches_dictlist)
         # to device
-        batches = {
-            key: [tensor.cuda() for tensor in tensorlist] for key, tensorlist in batches.items()
-        }
-        
+        batches = {key: [tensor.cuda() for tensor in tensorlist] for key, tensorlist in batches.items()}
+
         inputs = {**batches, "step": step}
 
         step_vals = algorithm.update(**inputs)
-        
 
         for key, val in step_vals.items():
             checkpoint_vals[key].append(val)
@@ -167,8 +180,6 @@ def train(test_envs, args, hparams, n_steps, checkpoint_freq, logger, writer, ta
 
         if swad:
             swad_algorithm.update_parameters(algorithm, step=step)
-
-
 
         if step % checkpoint_freq == 0:
             results = {
@@ -187,7 +198,7 @@ def train(test_envs, args, hparams, n_steps, checkpoint_freq, logger, writer, ta
             # merge results
             results.update(summaries)
             results.update(accuracies)
-            
+
             # print
             if results_keys != last_results_keys:
                 logger.info(misc.to_row(results_keys))
@@ -205,6 +216,27 @@ def train(test_envs, args, hparams, n_steps, checkpoint_freq, logger, writer, ta
 
             writer.add_scalars_with_prefix(summaries, step, f"{testenv_name}/summary/")
             writer.add_scalars_with_prefix(accuracies, step, f"{testenv_name}/all/")
+
+            # Log evaluation metrics to WandB
+            if wandb_logger:
+                # Log summaries with prefix
+                for key, val in summaries.items():
+                    wandb_logger.log({f"summary/{testenv_name}/{key}": val, "step": step})
+
+                # Log accuracies with prefix
+                for key, val in accuracies.items():
+                    wandb_logger.log({f"accuracy/{testenv_name}/{key}": val, "step": step})
+
+                # Log overall metrics
+                wandb_logger.log(
+                    {
+                        "evaluation/epoch": step / steps_per_epoch,
+                        "evaluation/eval_time": results["eval_time"],
+                        "step": step,
+                    }
+                )
+
+            # Save checkpoint
             if not sweep:
                 if best_acc <= summaries["train_out"]:
                     ckpt_dir = args.out_dir / "checkpoints"
@@ -222,23 +254,30 @@ def train(test_envs, args, hparams, n_steps, checkpoint_freq, logger, writer, ta
                         "model_hparams": dict(hparams),
                         "test_envs": test_envs,
                         "model_dict": algorithm.cpu().state_dict(),
+                        "step": step,  # Save current step
                     }
                     algorithm.cuda()
                     if not args.debug:
                         torch.save(save_dict, path)
+                        if wandb_logger:
+                            wandb_logger.log_artifact(
+                                str(path),
+                                artifact_name=f"model_checkpoint_{step}",
+                                artifact_type="model_checkpoint",
+                                description=f"Model checkpoint at step {step}",
+                            )
                     else:
                         logger.debug("DEBUG Mode -> no save (org path: %s)" % path)
                     best_acc = summaries["train_out"]
             # swad
             if swad:
+
                 def prt_results_fn(results, avgmodel):
                     step_str = f" [{avgmodel.start_step}-{avgmodel.end_step}]"
                     row = misc.to_row([results[key] for key in results_keys if key in results])
                     logger.info(row + step_str)
 
-                swad.update_and_evaluate(
-                    swad_algorithm, results["train_out"], results["tr_outloss"], prt_results_fn
-                )
+                swad.update_and_evaluate(swad_algorithm, results["train_out"], results["tr_outloss"], prt_results_fn)
 
                 if hasattr(swad, "dead_valley") and swad.dead_valley:
                     logger.info("SWAD valley is dead -> early stop !")
@@ -246,10 +285,16 @@ def train(test_envs, args, hparams, n_steps, checkpoint_freq, logger, writer, ta
 
                 swad_algorithm = swa_utils.AveragedModel(algorithm)  # reset
 
-
         if step % args.tb_freq == 0:
             # add step values only for tb log
             writer.add_scalars_with_prefix(step_vals, step, f"{testenv_name}/summary/")
+            if wandb_logger:
+                wandb_logger.log(
+                    {
+                        "train/step": step,
+                        "train/loss": step_vals["loss"],
+                    }
+                )
 
     # find best
     logger.info("---")
@@ -290,7 +335,7 @@ def train(test_envs, args, hparams, n_steps, checkpoint_freq, logger, writer, ta
 
         ret["SWAD"] = results["test_in"]
         ret["SWAD (inD)"] = results[in_key]
-        
+
         ckpt_dir = args.out_dir / "checkpoints"
         ckpt_dir.mkdir(exist_ok=True)
 
@@ -310,7 +355,7 @@ def train(test_envs, args, hparams, n_steps, checkpoint_freq, logger, writer, ta
         swad_algorithm.cuda()
         if not args.debug:
             torch.save(save_dict, path)
-            
+
     for k, acc in ret.items():
         logger.info(f"{k} = {acc:.3%}")
     if sweep:
